@@ -1,6 +1,10 @@
+
 import json
 import os
 import re
+import smtplib
+import ssl
+from email.message import EmailMessage
 
 import pandas as pd
 import streamlit as st
@@ -59,6 +63,8 @@ Candidate's matched skills: {skills}
 Rules: under 120 words, polite, do not invent dates, times or salary.
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
 
+EMAIL_PATTERN = r"[\w.+-]+@[\w-]+\.[\w.-]+"
+
 
 # ---------------- small helpers ----------------
 def read_file(f):
@@ -99,7 +105,7 @@ def fix_cgpa(cgpa, pct=None):
 
 
 def find_email(text):
-    m = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text or "")
+    m = re.search(EMAIL_PATTERN, text or "")
     return m.group(0) if m else None
 
 
@@ -120,6 +126,33 @@ def ask_gemini(client, prompt):
         except Exception:
             continue
     raise RuntimeError("Gemini failed")
+
+
+# ---------------- sending email ----------------
+def send_email(sender, app_password, to, subject, body):
+    """Send one email through Gmail. Returns (True, 'Sent') or (False, error text)."""
+    sender = (sender or "").strip()
+    to = (to or "").strip()
+    if not sender or not app_password:
+        return False, "Enter your Gmail address and App Password in the sidebar first."
+    if not re.fullmatch(EMAIL_PATTERN, to):
+        return False, "Recipient email is missing or not valid."
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20,
+                              context=ssl.create_default_context()) as server:
+            server.login(sender, app_password.replace(" ", ""))
+            server.send_message(msg)
+        return True, "Sent"
+    except smtplib.SMTPAuthenticationError:
+        return False, ("Gmail login failed. Use a Gmail App Password "
+                       "(needs 2-Step Verification), not your normal password.")
+    except Exception as e:
+        return False, f"Could not send: {e}"
 
 
 # ---------------- screening ----------------
@@ -217,6 +250,13 @@ def make_email(client, row, kind, company, role, hr):
             f"We wish you the very best.\n\nBest regards,\n{hr}\n{company}")
 
 
+def clear_draft_widgets():
+    """Remove old draft text boxes so new drafts start fresh."""
+    for key in list(st.session_state.keys()):
+        if key.startswith(("subject_", "body_", "to_")):
+            del st.session_state[key]
+
+
 # ---------------- sidebar ----------------
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -232,6 +272,15 @@ with st.sidebar:
         company = st.text_input("Company name", value="Company Name")
         role = st.text_input("Role title", value="Graduate Engineer Trainee")
         hr_name = st.text_input("Recruiter name", value="HR Team")
+
+    with st.expander("📧 Send emails (Gmail)"):
+        sender = st.text_input("Your Gmail address",
+                               value=os.environ.get("GMAIL_ADDRESS", ""))
+        app_pw = st.text_input("Gmail App Password", type="password",
+                               value=os.environ.get("GMAIL_APP_PASSWORD", ""))
+        st.caption("Use a Gmail App Password (Google Account > Security > 2-Step "
+                   "Verification > App passwords), not your normal password. "
+                   "Never put it in the code.")
 
 client = None
 if api_key.strip() and not offline:
@@ -287,11 +336,9 @@ if st.button("🚀 Screen Resumes", type="primary"):
             bar.progress((i + 1) / len(files))
 
         # save results and clear old questions / drafts
-        for key in list(st.session_state.keys()):
-            if key.startswith(("subject_", "body_")):
-                del st.session_state[key]
+        clear_draft_widgets()
         st.session_state.update(rows=rows, texts=texts, notes=notes, jd=jd,
-                                questions={}, drafts=[])
+                                questions={}, drafts=[], sent={})
 
 # ---------------- show results ----------------
 rows = st.session_state.get("rows")
@@ -321,6 +368,9 @@ if rows is not None:
     st.dataframe(table)
     st.download_button("⬇️ Download results (CSV)", table.to_csv().encode("utf-8"),
                        "screening_results.csv", "text/csv")
+
+    st.subheader("📊 Score chart")
+    st.bar_chart(df.set_index("file")["score"])
 
     st.subheader("🔍 Details")
     for r in df.to_dict("records"):
@@ -352,15 +402,13 @@ if rows is not None:
     # ---- email drafts ----
     st.subheader("✉️ Email drafts")
     st.caption("Shortlisted candidates get an interview invite, rejected ones get a polite regret email. "
-               "You can edit them here and download all drafts as a TXT file.")
+               "Check and edit each draft, then send it from here or download all drafts as a TXT file.")
     if st.button("Generate email drafts"):
         targets = [r for r in data if r["decision"] in ("Shortlist", "Reject")]
         if not targets:
             st.info("No shortlisted or rejected candidates.")
         else:
-            for key in list(st.session_state.keys()):
-                if key.startswith(("subject_", "body_")):
-                    del st.session_state[key]
+            clear_draft_widgets()
             drafts = []
             with st.spinner("Drafting emails..."):
                 for r in targets:
@@ -369,24 +417,65 @@ if rows is not None:
                     drafts.append({"id": r["id"], "name": r["name"], "to": r["email"],
                                    "kind": kind, "subject": subject, "body": body})
             st.session_state["drafts"] = drafts
+            st.session_state["sent"] = {}
 
     drafts = st.session_state.get("drafts", [])
+    sent = st.session_state.setdefault("sent", {})
+
+
+    def current_values(d):
+        """Latest (to, subject, body) of a draft, including edits made in the boxes."""
+        return (st.session_state.get(f"to_{d['id']}", d["to"] or ""),
+                st.session_state.get(f"subject_{d['id']}", d["subject"]),
+                st.session_state.get(f"body_{d['id']}", d["body"]))
+
+
+    if drafts:
+        st.markdown("**📤 Send emails**")
+        if st.button("📨 Send a test email to myself"):
+            ok, msg = send_email(sender, app_pw, sender, "Test - Resume Screening Agent",
+                                 "Email sending is working.")
+            if ok:
+                st.success("Test email sent. Check your inbox.")
+            else:
+                st.error(msg)
+
+        reviewed = st.checkbox("I have read and checked the invite emails")
+        if st.button("🚀 Send all invite emails", disabled=not reviewed):
+            invites = [d for d in drafts if d["kind"] == "invite"]
+            done = 0
+            with st.spinner("Sending..."):
+                for d in invites:
+                    to, subject, body = current_values(d)
+                    ok, msg = send_email(sender, app_pw, to, subject, body)
+                    sent[d["id"]] = "✅ Sent" if ok else f"❌ {msg}"
+                    done += int(ok)
+            st.info(f"Sent {done} of {len(invites)} invite emails. "
+                    "See each candidate below for details.")
+        st.caption("Rejection emails are not sent in bulk. Open a candidate below and "
+                   "press its own Send button.")
+
     for d in drafts:
         label = "Invite" if d["kind"] == "invite" else "Rejection"
         with st.expander(f"{label} → {d['name']} ({d['to'] or 'no email found'})"):
+            st.text_input("To", d["to"] or "", key=f"to_{d['id']}")
             st.text_input("Subject", d["subject"], key=f"subject_{d['id']}")
             st.text_area("Body", d["body"], height=220, key=f"body_{d['id']}")
+            if st.button("📤 Send this email", key=f"send_{d['id']}"):
+                to, subject, body = current_values(d)
+                ok, msg = send_email(sender, app_pw, to, subject, body)
+                sent[d["id"]] = "✅ Sent" if ok else f"❌ {msg}"
+            if d["id"] in sent:
+                st.write(sent[d["id"]])
 
     if drafts:
         parts = []
         for d in drafts:
-            subject = st.session_state[f"subject_{d['id']}"]
-            body = st.session_state[f"body_{d['id']}"]
-            parts.append(f"To: {d['to']}\nSubject: {subject}\n\n{body}\n" + "-" * 40)
+            to, subject, body = current_values(d)
+            parts.append(f"To: {to}\nSubject: {subject}\n\n{body}\n" + "-" * 40)
         text_file = "\n\n".join(parts)
         st.download_button("⬇️ Download email drafts (TXT)", text_file.encode("utf-8"),
                            "email_drafts.txt", "text/plain")
-
 
     #cd "C:\Users\pc\Favorites\Downloads\New folder"
     #conda activate screener
